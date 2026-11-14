@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import stat
 import time
+from pathlib import Path
+from uuid import UUID
 
 from app.core.errors import AppError
 from app.modules.co_debug.debug.broker import DebugCommandBroker
+from app.modules.co_debug.debug.events import DebugSessionEventPublisher
 from app.modules.co_debug.debug.manager import (
     DebugSessionManager,
     GdbMiCommandDispatcher,
@@ -14,6 +18,10 @@ from app.modules.co_debug.debug.platform_transport import (
 )
 from app.modules.co_debug.debug.session import GdbMiSession
 from app.modules.co_debug.debug.transport import GdbTransportClosed
+from app.modules.co_debug.schemas.debug import (
+    DebugBuildCandidate,
+    DebugExecutableCandidate,
+)
 from app.platform.domain.enums import TaskStatus, TaskType
 from app.platform.domain.task import TaskRecord
 from app.platform.schemas.tasks import DebugTaskRequest
@@ -45,10 +53,157 @@ class InteractiveDebugService:
         *,
         task_service: TaskService,
         session_manager: DebugSessionManager,
+        event_publisher: DebugSessionEventPublisher | None = None,
     ) -> None:
         self.task_service = task_service
         self.session_manager = session_manager
+        self.event_publisher = event_publisher
         self.dispatcher = GdbMiCommandDispatcher()
+
+
+    def list_candidates(
+        self,
+        *,
+        project_id: UUID | None = None,
+    ) -> list[DebugBuildCandidate]:
+        """Return retained successful builds that contain debuggable ELF executables."""
+        candidates: list[DebugBuildCandidate] = []
+
+        for task in self.task_service.list_tasks():
+            if (
+                task.task_type != TaskType.BUILD
+                or task.status != TaskStatus.SUCCEEDED
+            ):
+                continue
+
+            if (
+                project_id is not None
+                and task.project_id != project_id
+            ):
+                continue
+
+            try:
+                artifacts = self.task_service.list_task_artifacts(
+                    task.id
+                )
+            except AppError:
+                # Task history can outlive retained build artifacts.
+                # Such records are not valid debug candidates.
+                continue
+
+            executables: list[DebugExecutableCandidate] = []
+
+            for artifact_path, _ in artifacts:
+                try:
+                    artifact = self.task_service.resolve_task_artifact(
+                        task.id,
+                        artifact_path,
+                    )
+                except AppError:
+                    # Artifact availability can change between list/resolve.
+                    continue
+
+                if not self._is_debuggable_executable(artifact):
+                    continue
+
+                executables.append(
+                    DebugExecutableCandidate(
+                        name=artifact.name,
+                        executable_path=artifact_path,
+                    )
+                )
+
+            if not executables:
+                continue
+
+            executables.sort(
+                key=lambda item: item.executable_path
+            )
+
+            build_kind = (
+                "repair-build"
+                if task.metadata.get("operation")
+                == "dependency_repair_build"
+                else "build"
+            )
+
+            candidates.append(
+                DebugBuildCandidate(
+                    project_id=task.project_id,
+                    build_task_id=task.id,
+                    build_kind=build_kind,
+                    created_at=task.created_at,
+                    executables=executables,
+                )
+            )
+
+        return candidates
+
+    @staticmethod
+    def _is_debuggable_executable(
+        path: Path,
+    ) -> bool:
+        if not path.is_file():
+            return False
+
+        try:
+            with path.open("rb") as executable:
+                header = executable.read(64)
+                if len(header) < 18 or header[:4] != b"\x7fELF":
+                    return False
+
+                byte_order = {
+                    1: "little",
+                    2: "big",
+                }.get(header[5])
+                if byte_order is None:
+                    return False
+
+                # ZIP extraction intentionally does not trust archived permission
+                # bits, so retained build outputs can lose X_OK. Inspect the ELF
+                # object type instead; ET_REL objects stay excluded.
+                elf_type = int.from_bytes(header[16:18], byteorder=byte_order)
+                if elf_type == 2:  # ET_EXEC
+                    return True
+                if elf_type != 3:  # ET_DYN can be either a PIE or a shared library.
+                    return False
+
+                elf_class = header[4]
+                if elf_class == 1 and len(header) >= 46:  # ELF32
+                    program_offset = int.from_bytes(header[28:32], byteorder=byte_order)
+                    entry_size = int.from_bytes(header[42:44], byteorder=byte_order)
+                    entry_count = int.from_bytes(header[44:46], byteorder=byte_order)
+                elif elf_class == 2 and len(header) >= 58:  # ELF64
+                    program_offset = int.from_bytes(header[32:40], byteorder=byte_order)
+                    entry_size = int.from_bytes(header[54:56], byteorder=byte_order)
+                    entry_count = int.from_bytes(header[56:58], byteorder=byte_order)
+                else:
+                    return False
+
+                if entry_size < 4 or not 0 < entry_count <= 1024:
+                    return False
+                for index in range(entry_count):
+                    executable.seek(program_offset + index * entry_size)
+                    if int.from_bytes(executable.read(4), byteorder=byte_order) == 3:
+                        return True  # PT_INTERP identifies a runnable PIE.
+                return False
+        except OSError:
+            return False
+
+    @classmethod
+    def _ensure_debuggable_executable(
+        cls,
+        path: Path,
+    ) -> None:
+        if not cls._is_debuggable_executable(path):
+            raise AppError("debug executable is not a runnable ELF file")
+
+        try:
+            current_mode = path.stat().st_mode
+            if not current_mode & stat.S_IXUSR:
+                path.chmod(current_mode | stat.S_IXUSR)
+        except OSError as exc:
+            raise AppError("failed to prepare debug executable permissions") from exc
 
     async def create_task(
         self,
@@ -126,6 +281,10 @@ class InteractiveDebugService:
                     f"{request.executable_path}"
                 )
 
+            # This is the DEBUG task's private copy. The retained BUILD artifact
+            # and Project source remain immutable.
+            self._ensure_debuggable_executable(executable)
+
             transport: PlatformGdbTransport | None = None
             session: GdbMiSession | None = None
             dispatcher_task: asyncio.Task[None] | None = None
@@ -154,6 +313,8 @@ class InteractiveDebugService:
                     command_timeout_seconds=(
                         context.timeout_seconds
                     ),
+                    session_task_id=context.task_id,
+                    event_publisher=self.event_publisher,
                 )
 
                 await session.start(
@@ -161,6 +322,8 @@ class InteractiveDebugService:
                         context.timeout_seconds
                     )
                 )
+                await session.enforce_all_stop()
+                await session.enable_async_execution()
 
                 # 只有真正收到 (gdb) prompt 后，
                 # 才向API侧暴露这个Session。

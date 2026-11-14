@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from typing import Any
+from uuid import UUID, uuid4
 
+from app.core.time import utc_now
+from app.modules.co_debug.debug.events import (
+    DebugSessionEvent,
+    DebugSessionEventKind,
+    DebugSessionEventPublisher,
+)
 from app.modules.co_debug.debug.mi_commands import (
     MiCommandBuilder,
 )
@@ -14,6 +23,7 @@ from app.modules.co_debug.debug.models import (
     DebugBreakpoint,
     DebugSessionState,
     DebugSessionStateModel,
+    DebugThread,
     MiCommand,
     MiRecord,
     MiRecordKind,
@@ -22,6 +32,8 @@ from app.modules.co_debug.debug.transport import (
     GdbTransport,
     GdbTransportClosed,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class GdbMiError(RuntimeError):
@@ -102,6 +114,8 @@ class GdbMiSession:
         transport: GdbTransport,
         *,
         command_timeout_seconds: float = 10.0,
+        session_task_id: UUID | None = None,
+        event_publisher: DebugSessionEventPublisher | None = None,
     ) -> None:
         if command_timeout_seconds <= 0:
             raise ValueError(
@@ -109,11 +123,16 @@ class GdbMiSession:
                 "must be greater than 0"
             )
 
+        if event_publisher is not None and session_task_id is None:
+            raise ValueError("session_task_id is required when event_publisher is configured")
+
         self.transport = transport
 
         self.command_timeout_seconds = (
             command_timeout_seconds
         )
+        self.session_task_id = session_task_id
+        self.event_publisher = event_publisher
 
         self.command_builder = (
             MiCommandBuilder()
@@ -296,6 +315,22 @@ class GdbMiSession:
                 "done",
             },
         )
+
+    async def enable_async_execution(self) -> None:
+        """Allow MI control commands while the inferior is running."""
+        command = self.command_builder.gdb_set_mi_async()
+        record = await self._execute(command)
+        self._require_success(
+            command,
+            record,
+            allowed_classes={"done"},
+        )
+
+    async def enforce_all_stop(self) -> None:
+        """Explicitly keep the inferior in GDB all-stop mode."""
+        command = self.command_builder.gdb_set_all_stop()
+        record = await self._execute(command)
+        self._require_success(command, record, allowed_classes={"done"})
 
     async def insert_breakpoint(
         self,
@@ -620,6 +655,60 @@ class GdbMiSession:
 
         return stack
 
+    async def list_local_variables(
+        self,
+    ) -> list[Any]:
+        command = (
+            self.command_builder
+            .stack_list_variables()
+        )
+        record = await self._execute(command)
+        self._require_success(
+            command,
+            record,
+            allowed_classes={"done"},
+        )
+        if not isinstance(record.payload, dict):
+            return []
+        variables = record.payload.get("variables")
+        return variables if isinstance(variables, list) else []
+
+    async def list_threads(
+        self,
+    ) -> list[DebugThread]:
+        command = self.command_builder.thread_info()
+        record = await self._execute(command)
+        self._require_success(
+            command,
+            record,
+            allowed_classes={"done"},
+        )
+        self._update_threads_from_record(record)
+        return list(self.state.threads.values())
+
+    async def select_thread(
+        self,
+        thread_id: str,
+    ) -> list[DebugThread]:
+        # Refresh first so a stale UI cannot select a thread that has exited.
+        await self.list_threads()
+        if thread_id not in self.state.threads:
+            raise GdbMiError(
+                f"thread does not exist in this debug session: {thread_id}"
+            )
+
+        command = self.command_builder.thread_select(thread_id)
+        record = await self._execute(command)
+        self._require_success(
+            command,
+            record,
+            allowed_classes={"done"},
+        )
+        self.state.current_thread_id = thread_id
+        if isinstance(record.payload, dict):
+            self._update_current_frame(record.payload.get("frame"))
+        return await self.list_threads()
+
     async def wait_for_stop(
         self,
         *,
@@ -824,6 +913,16 @@ class GdbMiSession:
                         "GDB/MI output: "
                         f"{message.text}"
                     ) from exc
+                
+                if (
+                    record.kind
+                    == MiRecordKind.UNKNOWN
+                ):
+                    self._target_output.append(
+                        record.raw
+                    )
+
+                    continue
 
                 self._handle_record(
                     record
@@ -982,6 +1081,14 @@ class GdbMiSession:
                     record
                 )
 
+            return
+
+        if (
+            record.kind
+            == MiRecordKind.NOTIFY_ASYNC
+        ):
+            self._handle_notify_record(record)
+
     def _handle_stopped_record(
         self,
         record: MiRecord,
@@ -1005,6 +1112,28 @@ class GdbMiSession:
                 reason,
                 str,
             )
+            else None
+        )
+
+        stopped_thread_id = payload.get("thread-id")
+        if isinstance(stopped_thread_id, str) and stopped_thread_id:
+            self.state.stopped_thread_id = stopped_thread_id
+            self.state.current_thread_id = stopped_thread_id
+            self.state.threads.setdefault(
+                stopped_thread_id,
+                DebugThread(thread_id=stopped_thread_id),
+            )
+
+        stopped_threads = payload.get("stopped-threads")
+        if stopped_threads == "all":
+            for thread in self.state.threads.values():
+                thread.state = "stopped"
+        elif isinstance(stopped_thread_id, str):
+            self.state.threads[stopped_thread_id].state = "stopped"
+
+        self.state.breakpoint_hit_thread_id = (
+            stopped_thread_id
+            if reason == "breakpoint-hit" and isinstance(stopped_thread_id, str)
             else None
         )
 
@@ -1068,11 +1197,108 @@ class GdbMiSession:
             self._set_state(
                 DebugSessionState.EXITED
             )
+            self.state.stopped_thread_id = None
+            self.state.breakpoint_hit_thread_id = None
 
         else:
             self._set_state(
                 DebugSessionState.STOPPED
             )
+
+        if reason == "breakpoint-hit" and self.session_task_id is not None:
+            breakpoint_number = payload.get("bkptno")
+            if isinstance(breakpoint_number, str) and breakpoint_number:
+                self._publish_event(
+                    DebugSessionEvent(
+                        event_id=uuid4(),
+                        session_task_id=self.session_task_id,
+                        kind=DebugSessionEventKind.BREAKPOINT_HIT,
+                        occurred_at=utc_now(),
+                        breakpoint_number=breakpoint_number,
+                    )
+                )
+
+    def _handle_notify_record(
+        self,
+        record: MiRecord,
+    ) -> None:
+        payload = record.payload if isinstance(record.payload, dict) else {}
+        thread_id = payload.get("id")
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+
+        if record.message_class == "thread-created":
+            self.state.threads.setdefault(
+                thread_id,
+                DebugThread(thread_id=thread_id, state="running"),
+            )
+        elif record.message_class == "thread-exited":
+            self.state.threads.pop(thread_id, None)
+            if self.state.current_thread_id == thread_id:
+                self.state.current_thread_id = None
+            if self.state.stopped_thread_id == thread_id:
+                self.state.stopped_thread_id = None
+            if self.state.breakpoint_hit_thread_id == thread_id:
+                self.state.breakpoint_hit_thread_id = None
+        elif record.message_class == "thread-selected":
+            self.state.current_thread_id = thread_id
+
+    def _update_threads_from_record(
+        self,
+        record: MiRecord,
+    ) -> None:
+        payload = record.payload if isinstance(record.payload, dict) else {}
+        raw_threads = payload.get("threads")
+        refreshed: dict[str, DebugThread] = {}
+        if isinstance(raw_threads, list):
+            for item in raw_threads:
+                data = item.get("thread") if isinstance(item, dict) and "thread" in item else item
+                if not isinstance(data, dict):
+                    continue
+                thread_id = data.get("id")
+                if not isinstance(thread_id, str) or not thread_id:
+                    continue
+                target_id = data.get("target-id")
+                refreshed[thread_id] = DebugThread(
+                    thread_id=thread_id,
+                    linux_tid=self._linux_tid(target_id),
+                    name=data.get("name") if isinstance(data.get("name"), str) else None,
+                    state=data.get("state") if isinstance(data.get("state"), str) else "unknown",
+                    core=self._to_int(data.get("core")),
+                )
+
+        self.state.threads = refreshed
+        current = payload.get("current-thread-id")
+        if isinstance(current, str) and current:
+            self.state.current_thread_id = current
+        elif self.state.current_thread_id not in refreshed:
+            self.state.current_thread_id = None
+
+    @staticmethod
+    def _linux_tid(target_id: Any) -> int | None:
+        if not isinstance(target_id, str):
+            return None
+        match = re.search(r"\bLWP\s+(\d+)\b", target_id, re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    def _update_current_frame(self, frame: Any) -> None:
+        if not isinstance(frame, dict):
+            return
+        file_value = frame.get("fullname") or frame.get("file")
+        self.state.current_file = file_value if isinstance(file_value, str) else None
+        function = frame.get("func")
+        self.state.current_function = function if isinstance(function, str) else None
+        self.state.current_line = self._to_int(frame.get("line"))
+
+    def _publish_event(self, event: DebugSessionEvent) -> None:
+        publisher = self.event_publisher
+        if publisher is None:
+            return
+        try:
+            publisher.publish(event)
+        except Exception:
+            # Debug event delivery is optional and must never break the MI reader.
+            logger.exception("failed to publish GDB/MI debug event")
 
     def _set_state(
         self,
@@ -1084,6 +1310,10 @@ class GdbMiSession:
             DebugSessionState.RUNNING
         ):
             self._stop_event.clear()
+            self.state.stopped_thread_id = None
+            self.state.breakpoint_hit_thread_id = None
+            for thread in self.state.threads.values():
+                thread.state = "running"
 
         elif state in {
             DebugSessionState.STOPPED,

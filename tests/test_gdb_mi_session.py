@@ -1,7 +1,12 @@
 import asyncio
+from uuid import uuid4
 
 import pytest
 
+from app.modules.co_debug.debug.events import (
+    DebugSessionEventBus,
+    DebugSessionEventKind,
+)
 from app.modules.co_debug.debug.models import (
     DebugSessionState,
 )
@@ -217,6 +222,42 @@ async def test_session_waits_for_initial_prompt():
 
 
 @pytest.mark.asyncio
+async def test_breakpoint_hit_publishes_optional_non_blocking_event():
+    transport = FakeGdbTransport()
+    event_bus = DebugSessionEventBus()
+    events = []
+    subscription_id = event_bus.subscribe(asyncio.get_running_loop(), events.append)
+    task_id = uuid4()
+    session = GdbMiSession(
+        transport,
+        command_timeout_seconds=1,
+        session_task_id=task_id,
+        event_publisher=event_bus,
+    )
+    transport.emit("(gdb)")
+    await session.start()
+
+    try:
+        transport.emit(
+            '*stopped,reason="breakpoint-hit",bkptno="7",'
+            'frame={file="main.c",line="9"}'
+        )
+        await _wait_until(lambda: len(events) == 1)
+
+        event = events[0]
+        assert event.session_task_id == task_id
+        assert event.kind == DebugSessionEventKind.BREAKPOINT_HIT
+        assert event.breakpoint_number == "7"
+
+        transport.emit('*stopped,reason="signal-received",signal-name="SIGINT"')
+        await asyncio.sleep(0.01)
+        assert len(events) == 1
+    finally:
+        event_bus.unsubscribe(subscription_id)
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_insert_breakpoint_updates_state():
     transport = (
         FakeGdbTransport()
@@ -315,6 +356,8 @@ async def test_run_and_breakpoint_hit_update_state():
     )
 
     try:
+        transport.emit('=thread-created,id="2",group-id="i1"')
+        await _wait_until(lambda: "2" in session.state.threads)
         run_task = (
             asyncio.create_task(
                 session.run()
@@ -352,6 +395,8 @@ async def test_run_and_breakpoint_hit_update_state():
             '*stopped,'
             'reason="breakpoint-hit",'
             'bkptno="1",'
+            'thread-id="2",'
+            'stopped-threads="all",'
             'frame={'
             'func="main",'
             'file="main.c",'
@@ -390,6 +435,13 @@ async def test_run_and_breakpoint_hit_update_state():
             session.state.current_function
             == "main"
         )
+        assert session.state.current_thread_id == "2"
+        assert session.state.stopped_thread_id == "2"
+        assert session.state.breakpoint_hit_thread_id == "2"
+        assert session.state.threads["2"].state == "stopped"
+
+        transport.emit('=thread-exited,id="2",group-id="i1"')
+        await _wait_until(lambda: "2" not in session.state.threads)
 
     finally:
         await session.close()
@@ -876,6 +928,75 @@ async def test_delete_breakpoint_updates_state():
         assert (
             "1"
             not in session.state.breakpoints
+        )
+
+    finally:
+        await session.close()
+@pytest.mark.asyncio
+async def test_target_stream_is_preserved():
+    transport = FakeGdbTransport()
+
+    session = await _start_session(
+        transport
+    )
+
+    try:
+        transport.emit(
+            '@"program output\\n"'
+        )
+
+        await _wait_until(
+            lambda: (
+                session.target_output
+                == (
+                    "program output\n",
+                )
+            )
+        )
+
+        assert (
+            session.target_output
+            == (
+                "program output\n",
+            )
+        )
+
+    finally:
+        await session.close()
+
+@pytest.mark.asyncio
+async def test_raw_inferior_stdout_is_preserved():
+    transport = FakeGdbTransport()
+
+    session = await _start_session(
+        transport
+    )
+
+    try:
+        transport.emit(
+            "x = 5"
+        )
+
+        transport.emit(
+            "y = 3"
+        )
+
+        await _wait_until(
+            lambda: (
+                session.target_output
+                == (
+                    "x = 5",
+                    "y = 3",
+                )
+            )
+        )
+
+        assert (
+            session.target_output
+            == (
+                "x = 5",
+                "y = 3",
+            )
         )
 
     finally:

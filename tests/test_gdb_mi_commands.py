@@ -162,6 +162,10 @@ def test_execution_commands():
         builder.exec_interrupt()
     )
 
+    async_mode = (
+        builder.gdb_set_mi_async()
+    )
+
     exit_command = (
         builder.gdb_exit()
     )
@@ -199,7 +203,12 @@ def test_execution_commands():
 
     assert (
         exit_command.text
-        == "7-gdb-exit"
+        == "8-gdb-exit"
+    )
+
+    assert (
+        async_mode.text
+        == "7-gdb-set mi-async on"
     )
 
 
@@ -216,6 +225,10 @@ def test_inspection_commands():
         )
     )
 
+    variables = builder.stack_list_variables()
+    threads = builder.thread_info()
+    select_thread = builder.thread_select("2")
+
     assert (
         frames.text
         == "1-stack-list-frames"
@@ -225,6 +238,9 @@ def test_inspection_commands():
         '2-data-evaluate-expression '
         '"counter + 1"'
     )
+    assert variables.text == "3-stack-list-variables --simple-values"
+    assert threads.text == "4-thread-info"
+    assert select_thread.text == "5-thread-select 2"
 
 
 def test_command_builder_escapes_values():

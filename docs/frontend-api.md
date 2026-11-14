@@ -58,6 +58,9 @@ HTTP 422 是 FastAPI 标准错误，响应可能是 `{ "detail": [...] }`，不�
 
 `POST /api/v1/projects` 使用 `multipart/form-data`：文件字段名是 `archive`，内容为 ZIP；可选
 文本字段为 `name`。发送 `FormData` 时不要手动设置 `Content-Type`，让浏览器加入 boundary。
+上传限制：ZIP 成员最多 5,000 项（目录也计入），单个解压文件最多 16 MiB，解压总量最多 64 MiB；
+压缩 ZIP 最多 64 MiB，HTTP 请求 body 最多 65 MiB。上限提高不代表 NaturalCC 完整验收工程已验证可导入；
+按要求暂缓实测。
 
 `DELETE /api/v1/modules/co-debug/debug/sessions/{task_id}/breakpoints/{breakpoint_number}`
 用于删除断点，成功仍返回该 envelope。`GET /api/v1/tasks/{task_id}/artifacts/{artifact_path}`
@@ -73,6 +76,11 @@ envelope。前端可二选一：只使用 WebSocket 的历史加实时流；或�
 `status`、`progress`（0–100）、`error`、`result`，在终态停止轮询；日志 WebSocket 用于增量展示，
 不替代任务状态查询或最终结果读取。
 
+由当前运行器正常最终化的已启动 managed task，其终态 `TaskResponse.elapsed_ms` 为非负毫秒：
+模块提供显式值时保留，否则按 `started_at` 与 `finished_at` 补算；运行中取消也会持久化该值。
+未启动即取消时仍为 `null`。进程重启恢复遗留的 PENDING/RUNNING 任务时不补算耗时，
+该恢复路径的 `elapsed_ms` 可能为 `null`。
+
 ### 漏洞扫描与代码生成自检
 
 通过 `POST /api/v1/modules/vulnerability/tasks` 创建扫描任务，JSON body 及字段约束以
@@ -84,21 +92,23 @@ envelope。前端可二选一：只使用 WebSocket 的历史加实时流；或�
 | `scan_type` | `frequent_defects` 或 `high_risk`；分别创建漏洞扫描或风险检查任务。 |
 | `scope` | `targets` 或 `project`。使用 `targets` 时必须提供至少一个 `target_files`。 |
 
-可选字段：`source_task_id`（同项目已成功任务的 UUID；见下文）、`mode`（`builtin` 或 `deep`，默认
-`deep`）、`target_files`（相对路径，最多 50 项，默认空列表）、`sanitizer_report`（工作区内的
+可选字段：`source_task_id`（同项目已成功任务的 UUID；见下文）、`mode`（`builtin`、`deep` 或 `comprehensive`，默认
+`deep`）、`target_files`（工作区相对路径，最多 500 项，默认空列表）、`sanitizer_report`（工作区内的
 相对日志路径）、`incremental`（默认 `false`）、`severity_threshold`（`low`/`medium`/`high`/
-`critical`，默认 `medium`）、`max_findings`（1–100，默认 30）、`timeout_seconds`（1–300 秒，默认由
-服务配置决定）。未知字段会得到 422。所有文件路径都必须是工作区内的相对路径，不能使用绝对路径或
+`critical`，默认 `medium`）、`max_findings`（1–100，默认 30）、`timeout_seconds`（1–1000 秒，默认由
+服务配置决定）、`ground_truth_file`（可选，真值文件的工作区相对路径）、`rule_profile`（可选，`default`/`c_cpp`/`web`）。`targets` 范围的文件列表需包含真值引用的全部源文件。`max_findings` 限制 findings 返回列表；NaturalCC 在展示截断前计算 `contract_statistics`，前端保持上限 100 即可。未知字段会得到 422。所有文件路径都必须是工作区内的相对路径，不能使用绝对路径或
 `..`；`scope=project` 可不传 `target_files`。
 
 ```json
 {
   "project_id": "<project-uuid>",
   "scan_type": "frequent_defects",
-  "mode": "deep",
+  "mode": "comprehensive",
   "scope": "targets",
   "target_files": ["src/main.c"],
-  "incremental": true
+  "ground_truth_file": "ground_truth.json",
+  "rule_profile": "c_cpp",
+  "max_findings": 100
 }
 ```
 
@@ -108,6 +118,13 @@ envelope。前端可二选一：只使用 WebSocket 的历史加实时流；或�
 任务 `status` 与 coverage：`deep` 要求 builtin 为 `completed`，且 Cppcheck 至少有 `completed` 或
 `partial` coverage 才能通过；`partial` 明确表示部分覆盖，不代表完整 C/C++ 扫描。分析器不可用或未达到要求时任务会失败，
 coverage 仍可能包含诊断信息。
+
+扫描结果包含 `findings` / `raw_findings`（NaturalCC 返回的展示列表，受 `max_findings` 截断）、
+`target_findings`、`extra_findings`、coverage、报告和 `contract_statistics`。请求不传 `analyzer`；
+`mode=comprehensive` 由后端映射到上游综合分析。分类按后端的 `contract_category` 与上游 `category` /
+`category_label` 等信息展示；统计由上游在列表截断前计算，后端校验后透传。未传真值或统计状态为
+`not_evaluated` 时，前端只展示候选与 coverage，不得自行推算检出率、准确率、误报率或合同达标结论。
+后端定向测试通过；尚未与真实 NaturalCC/OpenEuler 联调。
 
 若扫描代码生成结果，传 `source_task_id` 为同一项目中状态为 `SUCCEEDED` 的代码生成任务 ID，
 `target_files` 写生成文件相对于该任务 workspace 的路径。后端从该任务 workspace 建立扫描副本，原项目
@@ -134,19 +151,25 @@ ThreadSanitizer (TSan) 日志通过可选 `sanitizer_report` 传入。先通过�
 ## A/B/C 路由分组
 
 所有路由、参数、状态码与 request/response schema 以 [`openapi.json`](openapi.json) 为准。下表按用途
-列出当前 37 个 HTTP path 的路由族；同一 path 的多个方法以 schema 为准。
+列出当前 41 个 HTTP path 的路由族；同一 path 的多个方法以 schema 为准。
 
 | 分组 | 用途 | 路由 |
 | --- | --- | --- |
 | 模块二 A：平台 | 健康、项目、模块清单、任务查询/日志/产物/取消与日志 WS | `GET /health`、`GET /modules`、`POST/GET /projects`、`GET /projects/{project_id}`、`GET /tasks`、`GET /tasks/{task_id}`、`GET /tasks/{task_id}/logs`、`GET /tasks/{task_id}/artifacts`、`GET /tasks/{task_id}/artifacts/{artifact_path}`、`POST /tasks/{task_id}/cancel`；另有 `WS /ws/v1/tasks/{task_id}/logs` |
 | 模块二 B：构建与调试 | 构建、调试、依赖分析/修复和完整调试会话 | `POST /tasks/build`、`POST /tasks/debug`、`POST /modules/co-debug/dependencies/analyze`、`repair`、`repair-build`、`POST /modules/co-debug/debug/sessions`、`GET /modules/co-debug/debug/sessions/{task_id}`、`GET /modules/co-debug/debug/sessions/{task_id}/state`、`GET /modules/co-debug/debug/sessions/{task_id}/stack-frames`、`POST /modules/co-debug/debug/sessions/{task_id}/arguments`、`breakpoints`、`run`、`continue`、`next`、`step`、`interrupt`、`wait`、`evaluate`、`close`、`DELETE /modules/co-debug/debug/sessions/{task_id}/breakpoints/{breakpoint_number}` |
-| 模块二 C：调度与指标 | 调度实验、调度对比与指标计算 | `POST /tasks/schedule-experiments`、`POST /tasks/schedule-comparisons`、`GET /modules/co-debug/metrics/build-success-rate`、`GET /modules/co-debug/metrics/improvement-rate` |
+| 模块二 C：调度与指标 | 调度实验、调度对比、批处理调试对比与指标计算 | `POST /tasks/schedule-experiments`、`POST /tasks/schedule-comparisons`、`POST /modules/co-debug/debug/comparisons`、`GET /modules/co-debug/metrics/build-success-rate`、`GET /modules/co-debug/metrics/improvement-rate`、`POST /modules/co-debug/metrics/debug-comparison-summary` |
 | 模块一接入：代码生成 | NaturalCC 连通状态、能力声明和统一任务生命周期 | `GET /modules/code-generation/health`、`GET /modules/code-generation/capabilities`、`POST /modules/code-generation/tasks` |
+| 模块一接入：漏洞扫描 | 对工程或生成产物发起扫描任务 | `POST /modules/vulnerability/tasks` |
 
-表中的 HTTP 路径均相对于 `/api/v1`，共 37 个；例如模块一健康请求是
+表中的 HTTP 路径均相对于 `/api/v1`，共 41 个；例如模块一健康请求是
 `GET /api/v1/modules/code-generation/health`。模块二 B 行中未重复完整前缀的依赖动作均为
 `/modules/co-debug/dependencies/{action}`，调试动作均为
 `/modules/co-debug/debug/sessions/{task_id}/{action}`。
+
+依赖分析响应继续保留兼容字段 `declared_dependencies: string[]`，并提供结构化
+`dependency_details`。前端应优先使用后者区分 `normal` 与 `order_only`，并通过
+`target_kind`/`generated` 展示 `generated_header`、`generated_source` 等生成目标；
+不得从兼容字符串反向猜测这些语义。
 
 ## `zhiyan-frontend` 接入点（说明，不在本仓库修改）
 
@@ -162,3 +185,27 @@ ThreadSanitizer (TSan) 日志通过可选 `sanitizer_report` 传入。先通过�
 
 页面目前仍是布局入口；建议在各业务模块新增各自 API/composable 后再绑定 UI，避免把 A/B/C 的
 请求细节堆入页面组件。
+
+## 批处理调试对比输入
+
+前端要从已上传的工程包中按预设调试作业发起指标（4）对比时，使用
+`POST /api/v1/modules/co-debug/debug/comparisons`。ZIP根目录的`debug-workloads.json`由测试用例维护者填写，描述每组的可执行程序、断点和参数；请求只需`project_id`，可选成功构建任务的`build_task_id`、`core_ids`和超时。后端生成完整GDB批处理命令并沿用C的FIFO/优化双跑。完整格式与限制见[`C模块批处理调试输入说明.md`](C模块批处理调试输入说明.md)。
+
+## 历史调试对比指标汇总
+
+`POST /api/v1/modules/co-debug/metrics/debug-comparison-summary`用于汇总已经完成的批处理调试对比。前端只提交历史`SCHEDULE_COMPARISON`任务ID：
+
+```json
+{
+  "comparison_task_ids": [
+    "11111111-1111-1111-1111-111111111111",
+    "22222222-2222-2222-2222-222222222222"
+  ]
+}
+```
+
+后端从持久化Task记录读取并校验任务类型、来源、成功状态和`ScheduleComparisonSummary`结果，再按每个Task一个实验样本计算平均提升率。请求不接受前端自行计算的`improvement_rate`、FIFO耗时或优化耗时。
+
+接口支持一个或多个样本，不要求必须为3个，也不设置固定的3样本上限。正式合同测试仍可由UI选择指定3套代码对应的历史结果。重复Task ID、普通`/tasks/schedule-comparisons`任务、未成功任务和结果结构不完整的任务会被拒绝。
+
+响应包含`sample_count`、按请求顺序返回的`comparison_results`、整体任务与时长差异资格、平均提升率、当前要求的提升率阈值及是否达标。新创建的DebugComparison Task会在metadata中记录`comparison_kind`、manifest路径和可为空的`build_task_id`；改动前仅含`debug_workload_manifest`的历史DebugComparison也可用于汇总。

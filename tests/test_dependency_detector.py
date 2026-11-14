@@ -1,6 +1,8 @@
 from app.modules.co_debug.dependency.dependency_analyzer import DependencyAnalyzer
 from app.modules.co_debug.dependency.dependency_detector import DependencyDetector
 from app.modules.co_debug.dependency.makefile_parser import MakefileParser
+from app.modules.co_debug.dependency.models import ActualDependency
+from app.modules.co_debug.dependency.pattern_rule_resolver import PatternRuleResolver
 from app.modules.co_debug.dependency.project_parser import ProjectParser
 
 
@@ -89,3 +91,78 @@ add.o: src/add.c include/add.h
     assert missing[0].dependency == "include/add.h"
 
     assert missing[0].source_file == "src/main.c"
+
+
+def test_order_only_prerequisite_does_not_satisfy_source_dependency(tmp_path):
+    makefile = tmp_path / "Makefile"
+    makefile.write_text("build/main.o: src/main.c | generated/version.h\n")
+    model = MakefileParser().parse(makefile)
+
+    missing = DependencyDetector().detect(
+        model,
+        [
+            ActualDependency(
+                target="build/main.o",
+                source_file="src/main.c",
+                dependencies=["src/main.c", "generated/version.h"],
+            )
+        ],
+    )
+
+    assert [(item.target, item.dependency) for item in missing] == [
+        ("build/main.o", "generated/version.h")
+    ]
+
+
+def test_pattern_rule_is_instantiated_for_an_actual_target(tmp_path):
+    makefile = tmp_path / "Makefile"
+    makefile.write_text("build/%.o: src/%.c | build\n")
+    model = MakefileParser().parse(makefile)
+
+    missing = DependencyDetector().detect(
+        model,
+        [
+            ActualDependency(
+                target="build/main.o",
+                source_file="src/main.c",
+                dependencies=["src/main.c"],
+            )
+        ],
+    )
+
+    assert missing == []
+
+
+def test_pattern_rule_matching_preserves_literal_prefix_suffix_semantics():
+    match = PatternRuleResolver._match
+
+    assert match("src/%.c", "src/main.c") == "main"
+    assert match("%.c", ".c") == ""
+    assert match("src/%", "src/main.c") == "main.c"
+    assert match("aa%aa", "aaa") is None
+    assert match("src/%.c", "lib/main.c") is None
+
+
+def test_generated_header_rule_does_not_hide_missing_compile_dependency(tmp_path):
+    makefile = tmp_path / "Makefile"
+    makefile.write_text(
+        "generated/version.h: VERSION scripts/gen_version.sh\n"
+        "\ttouch $@\n"
+        "build/main.o: src/main.c | build\n"
+    )
+    model = MakefileParser().parse(makefile)
+
+    missing = DependencyDetector().detect(
+        model,
+        [
+            ActualDependency(
+                target="build/main.o",
+                source_file="src/main.c",
+                dependencies=["src/main.c", "generated/version.h"],
+            )
+        ],
+    )
+
+    assert [(item.target, item.dependency) for item in missing] == [
+        ("build/main.o", "generated/version.h")
+    ]
